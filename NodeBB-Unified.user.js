@@ -33443,6 +33443,11 @@
 
     const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+    // מזהה את הסימן הישן (בלוק TAG), ואת מה שהוא שובר: ספוילר ||..|| או קישור.
+    const hasLegacy = str => typeof str === 'string' && /[\u{E0000}-\u{E007F}]/u.test(str);
+    const hasLinkOrSpoiler = str => typeof str === 'string' &&
+        (/\|\|[\s\S]*?\|\|/.test(str) || /https?:\/\/|www\.|\]\([^)]+\)/i.test(str));
+
     async function getCsrf() {
         try {
             const cfg = await W.fetch('/api/config', {
@@ -33485,13 +33490,17 @@
                 for (const p of list) {
                     const pid = p && p.pid;
                     if (!pid) continue;
+                    // פילטר-מהיר: בלי הסימן הישן ברינדור - דלג בלי למשוך raw
+                    if (typeof p.content === 'string' && !hasLegacy(p.content)) continue;
                     const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
                         headers: { Accept: 'application/json' }, credentials: 'same-origin',
                     }).then(r => r.json()).catch(() => null);
                     const raw = rawResp && rawResp.response && rawResp.response.content;
                     if (typeof raw !== 'string') continue;
-                    const fixed = insertMarkerInto(raw);
-                    if (fixed === raw) continue; // כבר תקין / רק-קישור - לא נוגעים
+                    // רק פוסטים שנשברו בפועל: סימן ישן + קישור/ספוילר
+                    if (!hasLegacy(raw) || !hasLinkOrSpoiler(raw)) continue;
+                    const fixed = insertMarkerInto(raw); // מנקה סימן ישן (+ מוסיף חדש אם יש מקום בטוח)
+                    if (fixed === raw) continue;
                     const put = await editPost(pid, fixed, csrf);
                     if (put && put.ok) edited += 1;
                     await sleep(EDIT_DELAY);
@@ -33514,10 +33523,11 @@
           + '<div class="nbbu-cc-title">ניקוי הפוסטים שלך - NodeBB Unified</div>'
           + '<div class="nbbu-cc-body">'
           + 'גרסאות קודמות של הסקריפט הוסיפו סימן נסתר לפוסטים שלך (לזיהוי מי מפעיל את הסקריפט). '
-          + 'אצל חלק מהקוראים שאין להם הסקריפט זה הופיע כריבוע קטן, או שבר ספוילר בסוף הודעה.<br><br>'
-          + 'הגרסה החדשה משתמשת בסימן משופר, בלתי-נראה לגמרי. אפשר לעבור על <b>כל הפוסטים שלך</b>, '
-          + 'לנקות את הסימן הישן ולהחליף בחדש.<br><br>'
-          + '<b>שים לב:</b> הפעולה מוסיפה תגית "נערך" לכל פוסט. היא רצה בשקט ברקע וממשיכה מאליה '
+          + 'הסימן הישן שבר ספוילרים וקישורים שהיו בפוסט, אצל הקוראים שאין להם הסקריפט.<br><br>'
+          + 'אפשר לתקן: מעבר על הפוסטים שלך, ותיקון <b>רק אלה שנשברו</b> (שיש בהם קישור או ספוילר '
+          + 'יחד עם הסימן הישן). שאר הפוסטים לא ייגעו.<br><br>'
+          + '<b>שים לב:</b> כל פוסט שיתוקן יקבל תגית "נערך", וגם יזוז בסדר בדף-הפוסטים שבפרופיל '
+          + '(הפוסטים שם ממוינים לפי מועד העריכה, לא הכתיבה). הפעולה רצה בשקט ברקע וממשיכה מאליה '
           + 'גם אחרי רענון או ניתוק-רשת.'
           + '</div>'
           + '<div class="nbbu-cc-btns">'
