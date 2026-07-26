@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeBB Unified – אוסף הכלים המאוחד
 // @namespace    https://mitmachim.top/nodebb-unified/
-// @version      2.0.0
+// @version      2.2.0
 // @description  מאחד את סקריפטי NodeBB המקוריים במודולים מבודדים עם פאנל ניהול מרכזי, גיבוי ואבחון
 // @author       מחברי הסקריפטים המקוריים
 // @updateURL    https://raw.githubusercontent.com/moishyf/NodeBB-Unified/main/NodeBB-Unified.user.js
@@ -15877,6 +15877,8 @@
     function injectChatButtons() {
         // בדיקה מקורית תחילה; ב-NodeBB מודרני app אינו תמיד גלובלי.
         const rawWin = pageWindow();
+        // בפורומים שהצ'אט מושבת בהם (config.disableChat) הכפתור מוביל לשום מקום - לא מזריקים.
+        if (rawWin.config && rawWin.config.disableChat) return;
         const originalUid = rawWin.app && rawWin.app.user
             ? rawWin.app.user.uid
             : null;
@@ -25684,8 +25686,7 @@
         // הצגת חלונית מידע במעבר עכבר
         enableTooltip: true,
 
-        // דירוג חכם: משקלים וקבועים (ניתנים לשינוי ע"י המשתמש).
-        // ניקוד = רעננות^severity × Σ(משקל × אחוזון_רכיב). נרמול=אחוזון (עמיד לחריגים).
+        // דירוג משוכלל: יחס מוניטין/פוסטים בלבד, בריכוך בייסיאני (R + C·m)/(P + C).
         // הנוסחה משוכפלת ב-test/ranking.test.js - לעדכן את שניהם יחד.
         scoring: {
             // הדירוג המשוכלל = יחס מוניטין/פוסטים (כמו שקובע באתר), בריכוך בייסיאני
@@ -33076,7 +33077,6 @@
 
     const MAGIC = 'nbbu';
     const VERSION = 1;
-    const TAG_BASE = 0xE0000; // כל תו ASCII X מקודד כ-U+E0000+X (בלתי-נראה, שורד את הסניטייזר)
 
     const ENABLED_KEY = 'nbbu_presence_enabled_v1';
     const CACHE_KEY = 'nbbu_presence_cache_v2'; // { uid: { isUser, key } }  key=pid/mid אחרון שנראה (v2: איפוס מטמון ישן)
@@ -33091,31 +33091,62 @@
     const log = (...a) => { if (DEBUG) console.log('%c[NBBU presence]', 'color:#8b5cf6;font-weight:700', ...a); };
 
     /* ---------- קידוד/פענוח הסימן ---------- */
-    // הנוסחה: magic+version כמחרוזת ASCII, כל תו -> תו-TAG. לעתיד אפשר להוסיף ".payload".
+    // נשא = רצף תווי רוחב-אפס: ZWSP=0, ZWNJ=1. שניהם נראים "כלום" בכל דפדפן/פונט,
+    // בניגוד לבלוק ה-TAG (U+E00xx) שהוצג כריבוע-tofu אצל חלק מהמשתמשים.
+    // מקודד חתימה קבועה (8 ביט, נדירה בטבע) + גרסה (4 ביט).
+    const BIT0 = String.fromCharCode(0x200B); // ZWSP
+    const BIT1 = String.fromCharCode(0x200C); // ZWNJ
+    const MAGIC_BITS = '10110100';
+    const LEGACY_RE = /[\u{E0000}-\u{E007F}]/gu; // סימני TAG ישנים - לניקוי
+
     function buildMarker() {
-        const s = MAGIC + VERSION; // "nbbu1"
-        let out = '';
-        for (const ch of s) {
-            out += String.fromCodePoint(TAG_BASE + ch.charCodeAt(0));
-        }
-        return out;
+        const bits = MAGIC_BITS + VERSION.toString(2).padStart(4, '0'); // 12 ביט
+        return bits.replace(/0/g, BIT0).replace(/1/g, BIT1);
     }
     const MARKER = buildMarker();
 
     function decodeMarker(text) {
         if (!text) return null;
-        let ascii = '';
+        // תווי רוחב-אפס -> ביטים; כל תו אחר מנתק את הרצף
+        let bits = '';
         for (const ch of text) {
-            const cp = ch.codePointAt(0);
-            if (cp >= TAG_BASE && cp <= TAG_BASE + 0x7f) {
-                ascii += String.fromCharCode(cp - TAG_BASE);
-            }
+            bits += ch === BIT0 ? '0' : ch === BIT1 ? '1' : ' ';
         }
-        if (!ascii.startsWith(MAGIC)) return null;
-        const ver = parseInt(ascii.slice(MAGIC.length), 10);
-        return { version: Number.isFinite(ver) ? ver : 0 };
+        const i = bits.indexOf(MAGIC_BITS);
+        if (i < 0) return null;
+        const v = bits.slice(i + 8, i + 12);
+        return { version: /^[01]{4}$/.test(v) ? parseInt(v, 2) : 0 };
     }
     const hasMarker = text => !!decodeMarker(text);
+
+    const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
+
+    // מזריק את הסימן מיד אחרי רצף-האותיות/ספרות הראשון שאינו חלק מקישור/מוזכר.
+    // כך הוא תמיד בין תווי-תוכן ולעולם לא נוגע בתוחם מרקדאון (ספוילר ||..|| גם כשהוא כל
+    // ההודעה, הדגשות, כותרות) ולא נבלע לתוך URL. אם אין מקום בטוח (הודעה שהיא רק קישור) -
+    // לא מסמנים בכלל (עדיף בלי חיווי מאשר לשבור קישור). גם מנקה TAG ישן.
+    // טווחים "לא בטוחים": URL, www, קישור-מרקדאון [..](..), מוזכר @.., האשטאג #..
+    const UNSAFE_RE = /(https?:\/\/\S+|www\.\S+|\[[^\]]*\]\([^)]*\)|[@#][^\s@#]+)/gi;
+    const RUN_RE = /[\p{L}\p{N}]+/gu;
+    function insertMarkerInto(str) {
+        if (typeof str !== 'string' || !str) return str;
+        const cleaned = stripLegacy(str);
+        if (hasMarker(cleaned)) return cleaned; // idempotent
+
+        const unsafe = [];
+        UNSAFE_RE.lastIndex = 0;
+        for (let u; (u = UNSAFE_RE.exec(cleaned));) unsafe.push([u.index, u.index + u[0].length]);
+        const inUnsafe = i => unsafe.some(([a, b]) => i > a && i <= b);
+
+        RUN_RE.lastIndex = 0;
+        for (let m; (m = RUN_RE.exec(cleaned));) {
+            const end = m.index + m[0].length;
+            if (!inUnsafe(m.index) && !inUnsafe(end)) {
+                return cleaned.slice(0, end) + MARKER + cleaned.slice(end);
+            }
+        }
+        return cleaned; // אין מקום בטוח (הכל קישור/סמלים) - לא מסמנים
+    }
 
     /* ---------- הזרקה לתוכן יוצא (fetch + XHR) ---------- */
     // עורך רק את גוף ה-write-API של NodeBB: content (פוסט/נושא/עריכה) או message (צ'אט).
@@ -33135,9 +33166,10 @@
             ? 'content'
             : (typeof data.message === 'string' ? 'message' : null);
         if (!field) return bodyStr;
-        if (hasMarker(data[field])) return bodyStr; // idempotent
 
-        data[field] = data[field] + MARKER;
+        const after = insertMarkerInto(data[field]);
+        if (after === data[field]) return bodyStr; // כבר מסומן / לא השתנה
+        data[field] = after;
         log('הוזרק סימן ל-' + field + ' (fetch/XHR)');
         try {
             return JSON.stringify(data);
@@ -33209,6 +33241,35 @@
     }
 
     /* ---------- סריקת פוסטים/צ'אט לזיהוי הסימן ---------- */
+    // מנתח תוכן מרונדר: האם יש סימן, והאם ההודעה היא "רק-קישור" (לא יכולה לשאת סימן).
+    // - מסיר ציטוטים (blockquote): סימן בתוך ציטוט שייך למצוטט, לא לכותב.
+    // - link-only: אחרי הסרת הקישורים לא נשאר טקסט => היעדר-סימן חסר-משמעות (לא רושמים שלילה).
+    function analyzeContent(el) {
+        if (!el) return { marked: false, linkOnly: false };
+        if (!el.querySelector('blockquote') && !el.querySelector('a')) {
+            return { marked: hasMarker(el.textContent), linkOnly: false };
+        }
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('blockquote').forEach(b => b.remove());
+        const marked = hasMarker(clone.textContent);
+        let linkOnly = false;
+        const links = clone.querySelectorAll('a');
+        if (links.length) {
+            links.forEach(a => a.remove());
+            linkOnly = clone.textContent.trim() === '';
+        }
+        return { marked, linkOnly };
+    }
+
+    // רושם נוכחות רק כשיש מסקנה: סימן => משתמש; אין סימן אך היה יכול לשאת => לא-משתמש;
+    // רק-קישור (לא יכול לשאת סימן) => לא מכריעים, כדי שפוסט/הודעה אחרונים שהם קישור לא ישברו.
+    function recordFrom(uid, key, el) {
+        if (!uid || uid === '0') return;
+        const { marked, linkOnly } = analyzeContent(el);
+        if (marked) recordPresence(uid, key, true);
+        else if (!linkOnly) recordPresence(uid, key, false);
+    }
+
     function scanContainer(root) {
         if (!(root instanceof Element) && root !== document) return;
         const scope = root === document ? document : root;
@@ -33216,17 +33277,16 @@
         // פוסטים
         scope.querySelectorAll('[component="post"][data-pid]').forEach(post => {
             const uid = post.getAttribute('data-uid');
-            if (!uid || uid === '0') return;
             const body = post.querySelector('[component="post/content"]') || post;
-            recordPresence(uid, post.getAttribute('data-pid'), hasMarker(body.textContent));
+            recordFrom(uid, post.getAttribute('data-pid'), body);
         });
 
         // הודעות צ'אט
         scope.querySelectorAll('[component="chat/message"][data-mid]').forEach(msg => {
             const host = msg.closest('[data-uid]') || msg.querySelector('[data-uid]');
             const uid = (host && host.getAttribute('data-uid')) || msg.getAttribute('data-uid');
-            if (!uid || uid === '0') return;
-            recordPresence(uid, msg.getAttribute('data-mid'), hasMarker(msg.textContent));
+            const bodyEl = msg.querySelector('[component="chat/message/body"]') || msg;
+            recordFrom(uid, msg.getAttribute('data-mid'), bodyEl);
         });
     }
 
@@ -33263,6 +33323,26 @@
                 vertical-align: -0.12em !important;
             }
             .${CHAT_MARK_CLASS} svg { width: .66em !important; height: .66em !important; display: block !important; }
+
+            /* מודעת ההסכמה לניקוי */
+            #nbbu-cleanup-consent {
+                position: fixed !important; z-index: 2147483000 !important;
+                inset-inline-end: 18px !important; bottom: 18px !important;
+                max-width: 380px !important; font-family: inherit !important;
+            }
+            #nbbu-cleanup-consent .nbbu-cc-card {
+                background: var(--bs-body-bg, #fff) !important; color: var(--bs-body-color, #111) !important;
+                border: 1px solid rgba(139,92,246,.5) !important; border-top: 4px solid #8b5cf6 !important;
+                border-radius: 12px !important; box-shadow: 0 8px 30px rgba(0,0,0,.28) !important;
+                padding: 16px 18px !important;
+            }
+            #nbbu-cleanup-consent .nbbu-cc-title { font-weight: 800; font-size: 15px; margin-bottom: 8px; color: #8b5cf6; }
+            #nbbu-cleanup-consent .nbbu-cc-body { font-size: 13px; line-height: 1.6; }
+            #nbbu-cleanup-consent .nbbu-cc-btns { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+            #nbbu-cleanup-consent button { border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 700; cursor: pointer; font-size: 13px; }
+            #nbbu-cleanup-consent .nbbu-cc-yes { background: #8b5cf6; color: #fff; }
+            #nbbu-cleanup-consent .nbbu-cc-maybe { background: rgba(127,127,127,.15); color: inherit; }
+            #nbbu-cleanup-consent .nbbu-cc-no { background: transparent; color: inherit; opacity: .65; }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
@@ -33351,8 +33431,17 @@
         });
     }
 
-    /* ---------- ריצה ראשונה: עריכת הפוסט האחרון להוספת הסימן (חיווי מיידי) ---------- */
-    const FIRSTRUN_KEY = 'nbbu_presence_firstrun_v2'; // v2: איפוס כדי לנסות שוב את עריכת-הפוסט
+    /* ---------- ניקוי פוסטים מלא (בהסכמה) + מעבר לסימן החדש ---------- */
+    // חד-פעמי-פר-התקנה: מודעה צפה מסבירה; ב"כן" רץ בשקט מוחלט ברקע על *כל* הפוסטים
+    // (מנקה תווי-TAG ישנים + מוסיף את הסימן החדש). מתחדש לבד אחרי רענון/נפילת-רשת.
+    const CHOICE_KEY = 'nbbu_cleanup_choice_v1';   // 'yes' | 'no' (ריק = לשאול)
+    const DONE_KEY = 'nbbu_cleanup_done_v1';        // הסריקה הושלמה
+    const PAGE_KEY = 'nbbu_cleanup_page_v1';        // עמוד הבא לעיבוד (נקודת-חידוש)
+    const EDIT_DELAY = 1500;                        // ms בין עריכות (הגנה מ-rate-limit)
+    let sweepRunning = false;
+    let snoozed = false;                            // "אולי אחר כך" - עד הטעינה הבאה
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
 
     async function getCsrf() {
         try {
@@ -33363,39 +33452,100 @@
         } catch { return null; }
     }
 
-    async function firstRunEditLastPost() {
-        if (!enabled) { log('ריצה-ראשונה: מכובה'); return; }
-        if (GM_getValue(FIRSTRUN_KEY, false)) { log('ריצה-ראשונה: כבר בוצעה בעבר'); return; }
+    async function editPost(pid, content, csrf) {
+        return W.fetch('/api/v3/posts/' + pid, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ content }),
+        }).catch(() => null);
+    }
+
+    // סריקה עמוד-אחר-עמוד (חדש->ישן) על כל פוסטי המשתמש; עורכת רק מה שצריך שינוי.
+    // כל עמוד נשמר ב-GM, אז רענון/נפילת-רשת ממשיכים בדיוק מאותה נקודה.
+    async function runCleanupSweep() {
+        if (sweepRunning || !enabled) return;
+        if (GM_getValue(CHOICE_KEY, '') !== 'yes' || GM_getValue(DONE_KEY, false)) return;
         const user = W.app && W.app.user;
-        if (!user || !user.uid || !user.userslug) { log('ריצה-ראשונה: אין משתמש מחובר'); return; }
+        if (!user || !user.uid || !user.userslug) return;
+        const csrf = await getCsrf();
+        if (!csrf) return; // ננסה שוב בטיק הבא
+        sweepRunning = true;
+        let edited = 0;
         try {
-            const posts = await W.fetch(
-                '/api/user/' + encodeURIComponent(user.userslug) + '/posts',
-                { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
-            ).then(r => r.json());
-            const pid = posts && posts.posts && posts.posts[0] && posts.posts[0].pid;
-            if (!pid) { log('ריצה-ראשונה: לא נמצאו פוסטים למשתמש', posts); GM_setValue(FIRSTRUN_KEY, true); return; }
-            log('ריצה-ראשונה: פוסט אחרון pid=' + pid);
+            let page = Number(GM_getValue(PAGE_KEY, 1)) || 1;
+            for (;;) {
+                const resp = await W.fetch(
+                    '/api/user/' + encodeURIComponent(user.userslug) + '/posts?page=' + page,
+                    { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+                ).then(r => r.json()).catch(() => null);
+                if (!resp) break; // רשת נפלה - עוצרים; page שמור, נמשיך אחר כך
+                const list = resp.posts || [];
+                const pageCount = (resp.pagination && resp.pagination.pageCount) || page;
+                for (const p of list) {
+                    const pid = p && p.pid;
+                    if (!pid) continue;
+                    const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
+                        headers: { Accept: 'application/json' }, credentials: 'same-origin',
+                    }).then(r => r.json()).catch(() => null);
+                    const raw = rawResp && rawResp.response && rawResp.response.content;
+                    if (typeof raw !== 'string') continue;
+                    const fixed = insertMarkerInto(raw);
+                    if (fixed === raw) continue; // כבר תקין / רק-קישור - לא נוגעים
+                    const put = await editPost(pid, fixed, csrf);
+                    if (put && put.ok) edited += 1;
+                    await sleep(EDIT_DELAY);
+                }
+                if (page >= pageCount) { GM_setValue(DONE_KEY, true); log('ניקוי מלא: הושלם (' + edited + ' נערכו)'); break; }
+                page += 1;
+                GM_setValue(PAGE_KEY, page);
+            }
+        } catch (e) { log('ניקוי מלא: שגיאה', e); }
+        finally { sweepRunning = false; }
+    }
 
-            // תוכן גולמי (markdown) - חובה כדי לא להשחית את הפוסט
-            const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
-                headers: { Accept: 'application/json' }, credentials: 'same-origin',
-            }).then(r => r.json());
-            const raw = rawResp && rawResp.response && rawResp.response.content;
-            if (typeof raw !== 'string') { log('ריצה-ראשונה: לא התקבל תוכן גולמי', rawResp); return; }
-            if (hasMarker(raw)) { log('ריצה-ראשונה: הפוסט כבר מסומן'); GM_setValue(FIRSTRUN_KEY, true); return; }
+    function showCleanupConsent() {
+        if (document.getElementById('nbbu-cleanup-consent')) return;
+        const box = document.createElement('div');
+        box.id = 'nbbu-cleanup-consent';
+        box.dir = 'rtl';
+        box.innerHTML =
+            '<div class="nbbu-cc-card">'
+          + '<div class="nbbu-cc-title">ניקוי הפוסטים שלך - NodeBB Unified</div>'
+          + '<div class="nbbu-cc-body">'
+          + 'גרסאות קודמות של הסקריפט הוסיפו סימן נסתר לפוסטים שלך (לזיהוי מי מפעיל את הסקריפט). '
+          + 'אצל חלק מהקוראים שאין להם הסקריפט זה הופיע כריבוע קטן, או שבר ספוילר בסוף הודעה.<br><br>'
+          + 'הגרסה החדשה משתמשת בסימן משופר, בלתי-נראה לגמרי. אפשר לעבור על <b>כל הפוסטים שלך</b>, '
+          + 'לנקות את הסימן הישן ולהחליף בחדש.<br><br>'
+          + '<b>שים לב:</b> הפעולה מוסיפה תגית "נערך" לכל פוסט. היא רצה בשקט ברקע וממשיכה מאליה '
+          + 'גם אחרי רענון או ניתוק-רשת.'
+          + '</div>'
+          + '<div class="nbbu-cc-btns">'
+          + '<button class="nbbu-cc-yes">כן, נקה</button>'
+          + '<button class="nbbu-cc-maybe">אולי אחר כך</button>'
+          + '<button class="nbbu-cc-no">לא</button>'
+          + '</div></div>';
+        const close = () => box.remove();
+        box.querySelector('.nbbu-cc-yes').addEventListener('click', () => {
+            GM_setValue(CHOICE_KEY, 'yes'); close(); runCleanupSweep();
+        });
+        box.querySelector('.nbbu-cc-no').addEventListener('click', () => {
+            GM_setValue(CHOICE_KEY, 'no'); close();
+        });
+        box.querySelector('.nbbu-cc-maybe').addEventListener('click', () => {
+            snoozed = true; close(); // נשאל שוב בטעינה הבאה
+        });
+        document.body.appendChild(box);
+    }
 
-            const csrf = await getCsrf();
-            if (!csrf) { log('ריצה-ראשונה: אין csrf token'); return; }
-            const put = await W.fetch('/api/v3/posts/' + pid, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
-                credentials: 'same-origin',
-                body: JSON.stringify({ content: raw + MARKER }),
-            });
-            log('ריצה-ראשונה: PUT עריכת פוסט ' + pid + ' -> ' + put.status);
-            if (put.ok) GM_setValue(FIRSTRUN_KEY, true);
-        } catch (e) { log('ריצה-ראשונה: שגיאה', e); }
+    function maybeAskCleanup() {
+        if (!enabled || snoozed) return;
+        if (GM_getValue(CHOICE_KEY, '') === 'no' || GM_getValue(DONE_KEY, false)) return;
+        if (GM_getValue(CHOICE_KEY, '') === 'yes') { runCleanupSweep(); return; } // אושר - להמשיך
+        const user = W.app && W.app.user;
+        if (!user || !user.uid) return;
+        if (Number(user.postcount) === 0) { GM_setValue(DONE_KEY, true); return; } // אין מה לנקות
+        showCleanupConsent();
     }
 
     function whenAppReady(cb, tries = 40) {
@@ -33479,6 +33629,224 @@
         });
     }
 
+    /* ---------- עמוד מרוכז: כל משתמשי הסקריפט במקום אחד ----------
+       הפילטר ב-/users רק מסתיר לא-משתמשים בתוך העמוד המעומד של NodeBB, אז אי אפשר
+       לספור/לראות את כולם בלי לדפדף את כל הפורום. כאן אוספים לרשימה אחת: seed מהמטמון
+       (מי שנראה בגלישה) + קציר פעילים (מקוונים + נושאים אחרונים) + סריקה-עמוקה אופציונלית. */
+    const META_KEY = 'nbbu_presence_meta_v1'; // uid -> {name, slug, pic, it, ib}
+    let meta = {};
+    try { meta = GM_getValue(META_KEY, {}) || {}; } catch { meta = {}; }
+    let metaFlush = null;
+    function scheduleMetaFlush() {
+        if (metaFlush) return;
+        metaFlush = setTimeout(() => {
+            metaFlush = null;
+            try { GM_setValue(META_KEY, meta); } catch { /* מלא? מתעלמים */ }
+        }, 3000);
+    }
+    function escHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+            ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function rememberUser(u) {
+        if (!u || !u.uid) return;
+        const uid = String(u.uid);
+        const slug = u.userslug || u.slug || '';
+        const prev = meta[uid] || {};
+        meta[uid] = {
+            name: u.username || prev.name || slug || ('uid ' + uid),
+            slug: slug || prev.slug || '',
+            pic: (u.picture != null ? u.picture : prev.pic) || '',
+            it: (u['icon:text'] != null ? u['icon:text'] : prev.it) || '',
+            ib: (u['icon:bgColor'] != null ? u['icon:bgColor'] : prev.ib) || '#888'
+        };
+        scheduleMetaFlush();
+    }
+    async function apiGet(path) {
+        try {
+            const r = await W.fetch(path, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+            return JSON.parse(await r.text());
+        } catch { return null; }
+    }
+    // בודק משתמש בודד: מושך פוסטים, מחפש סימן, ותופס מטא אגב-אורחא
+    async function probeUser(uid, slug) {
+        if (!slug) return false;
+        if (cache[uid] && cache[uid].isUser) return true;
+        const r = await apiGet('/api/user/' + encodeURIComponent(slug) + '/posts');
+        const posts = (r && r.posts) || [];
+        if (posts[0] && posts[0].user) rememberUser(posts[0].user);
+        const is = posts.some(p => hasMarker(p && (p.content || '')));
+        if (is) { rememberUser({ uid, userslug: slug, username: posts[0] && posts[0].user && posts[0].user.username }); recordPresence(uid, Date.now(), true); }
+        return is;
+    }
+    // השלמת מטא לפי uid: מי שזוהה תוך גלישה נכנס למטמון בלי שם (הסריקה קוראת רק uid+סימן).
+    // /api/user/uid/<uid> מחזיר שם/סלאג/אווטאר. רץ עצמאית (לא מושפע מעצירת הסריקה), עם דה-דופ.
+    const metaFetching = new Set();
+    function needsMeta(uid) {
+        const m = meta[uid];
+        return !m || !m.name || /^uid /.test(m.name) || !m.slug;
+    }
+    async function backfillMeta(uids) {
+        const need = [...new Set(uids)].filter(uid => !metaFetching.has(uid) && needsMeta(uid));
+        if (!need.length) return;
+        need.forEach(uid => metaFetching.add(uid));
+        let i = 0;
+        const worker = async () => {
+            while (i < need.length) {
+                const uid = need[i++];
+                const d = await apiGet('/api/user/uid/' + encodeURIComponent(uid));
+                if (d && (d.username || d.userslug)) {
+                    rememberUser({ uid, username: d.username, userslug: d.userslug, picture: d.picture, 'icon:text': d['icon:text'], 'icon:bgColor': d['icon:bgColor'] });
+                }
+                metaFetching.delete(uid);
+                refreshUI();
+            }
+        };
+        await Promise.all([worker(), worker(), worker()]);
+    }
+
+    let scanBusy = false, scanStop = false, scanProgress = '';
+    // ריצה חסומת-קונקורנטיות (3) עם אפשרות-עצירה
+    async function runPool(items, worker, onTick) {
+        let i = 0, active = 0, done = 0;
+        return new Promise(resolve => {
+            const pump = () => {
+                if (scanStop) { if (active === 0) resolve(); return; }
+                while (active < 3 && i < items.length) {
+                    const it = items[i++]; active += 1;
+                    Promise.resolve(worker(it)).catch(() => {}).then(() => {
+                        active -= 1; done += 1;
+                        if (onTick) onTick(done, items.length);
+                        pump();
+                    });
+                }
+                if (active === 0 && i >= items.length) resolve();
+            };
+            pump();
+        });
+    }
+    function setProgress(t) { scanProgress = t; const el = document.getElementById('nbbu-up-progress'); if (el) el.textContent = t; }
+    // קציר פעילים: מקוונים + N עמודי נושאים-אחרונים -> בדיקת סימן למי שעוד לא ידוע
+    async function harvestActive(pages = 5) {
+        const cands = new Map(); // slug -> uid
+        const online = await apiGet('/api/users?section=online');
+        ((online && online.users) || []).forEach(u => { if (u.userslug) { cands.set(u.userslug, u.uid); rememberUser(u); } });
+        for (let p = 1; p <= pages && !scanStop; p += 1) {
+            const rec = await apiGet('/api/recent?page=' + p);
+            ((rec && rec.topics) || []).forEach(t => {
+                [t.user, t.teaser && t.teaser.user].forEach(u => { if (u && u.userslug) { cands.set(u.userslug, u.uid); rememberUser(u); } });
+            });
+        }
+        const list = [...cands].map(([slug, uid]) => ({ slug, uid })).filter(x => !(cache[x.uid] && cache[x.uid].isUser));
+        let n = 0;
+        await runPool(list, x => probeUser(x.uid, x.slug), (d, tot) => { n = d; setProgress('קציר פעילים: ' + d + '/' + tot + ' נבדקו, ' + scriptUsers().length + ' נמצאו'); refreshUI(); });
+        setProgress('קציר הסתיים: ' + scriptUsers().length + ' משתמשים');
+    }
+    // ponytail: סריקה מלאה = בקשה לכל משתמש בפורום (מתמחים ~30k => ~612 עמודים). אופציונלי, ניתן-לעצירה,
+    // ומצטבר (מי שכבר נעול במטמון מדולג), אז ריצה חוזרת מתקדמת. לא רץ אוטומטית - רק בלחיצה.
+    async function deepScan() {
+        const first = await apiGet('/api/users?section=joindate&page=1');
+        const pageCount = (first && first.pagination && first.pagination.pageCount) || 1;
+        const total = (first && first.userCount) || pageCount * 50;
+        let checked = 0;
+        for (let p = 1; p <= pageCount && !scanStop; p += 1) {
+            const data = p === 1 ? first : await apiGet('/api/users?section=joindate&page=' + p);
+            const users = (data && data.users) || [];
+            users.forEach(rememberUser);
+            const list = users.filter(u => u.userslug && !(cache[u.uid] && cache[u.uid].isUser));
+            await runPool(list, u => probeUser(u.uid, u.userslug), () => { checked += 1; setProgress('סריקה עמוקה: ' + checked + '/' + total + ' נבדקו, ' + scriptUsers().length + ' נמצאו'); refreshUI(); });
+        }
+        setProgress((scanStop ? 'נעצר: ' : 'הסתיים: ') + scriptUsers().length + ' משתמשים');
+    }
+    async function runScan(fn) {
+        if (scanBusy) { scanStop = true; return; } // לחיצה שנייה = עצור
+        scanBusy = true; scanStop = false; refreshUI();
+        try { await fn(); } finally { scanBusy = false; scanStop = false; refreshUI(); }
+    }
+    function scriptUsers() {
+        return Object.keys(cache)
+            .filter(uid => cache[uid] && cache[uid].isUser)
+            .map(uid => ({ uid, name: (meta[uid] && meta[uid].name) || ('uid ' + uid), slug: (meta[uid] && meta[uid].slug) || '', pic: meta[uid] && meta[uid].pic, it: meta[uid] && meta[uid].it, ib: (meta[uid] && meta[uid].ib) || '#888' }));
+    }
+    function avatarHtml(u) {
+        if (u.pic) return '<img src="' + escHtml(u.pic) + '" style="width:34px;height:34px;border-radius:50%;object-fit:cover;flex:0 0 auto;">';
+        return '<span style="width:34px;height:34px;border-radius:50%;background:' + escHtml(u.ib) + ';color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;flex:0 0 auto;">' + escHtml(u.it || (u.name || '?').slice(0, 1)) + '</span>';
+    }
+    const UP_ID = 'nbbu-users-panel';
+    let modalOpen = false;
+    function ensureButton() {
+        if (!onUsersPage()) { const b = document.getElementById(UP_ID + '-btn'); if (b) b.remove(); return; }
+        let b = document.getElementById(UP_ID + '-btn');
+        if (!b) {
+            b = document.createElement('button');
+            b.id = UP_ID + '-btn'; b.type = 'button';
+            b.style.cssText = 'position:fixed;inset-inline-start:16px;bottom:16px;z-index:99990;display:flex;align-items:center;gap:8px;'
+                + 'padding:10px 15px;border:none;border-radius:999px;background:#8b5cf6;color:#fff;font:700 14px/1 inherit;cursor:pointer;'
+                + 'box-shadow:0 3px 12px rgba(0,0,0,.3);';
+            b.addEventListener('click', openModal);
+            document.body.appendChild(b);
+        }
+        b.innerHTML = '<span style="display:inline-flex;width:18px;height:18px;border-radius:50%;background:#fff;color:#8b5cf6;'
+            + 'align-items:center;justify-content:center;font-weight:900;font-size:12px;">✓</span> משתמשי הסקריפט (' + scriptUsers().length + ')';
+    }
+    function openModal() {
+        if (document.getElementById(UP_ID)) return;
+        modalOpen = true;
+        const host = document.createElement('div');
+        host.id = UP_ID;
+        host.style.cssText = 'position:fixed;inset:0;z-index:99991;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;direction:rtl;';
+        host.innerHTML =
+            '<div style="background:var(--bs-body-bg,#fff);color:var(--bs-body-color,#212529);width:min(560px,94vw);max-height:88vh;display:flex;flex-direction:column;border-radius:14px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.4);font:14px/1.4 inherit;">'
+            + '<div style="display:flex;align-items:center;gap:8px;padding:14px 16px;background:#8b5cf6;color:#fff;font-weight:800;">'
+            + '<span style="flex:1;">משתמשי הסקריפט (<span id="nbbu-up-count">0</span>)</span>'
+            + '<button id="nbbu-up-close" type="button" style="border:none;background:transparent;color:#fff;font-size:22px;line-height:1;cursor:pointer;">×</button></div>'
+            + '<div style="padding:10px 16px;"><input id="nbbu-up-search" type="search" placeholder="חיפוש לפי שם..." style="width:100%;padding:8px 12px;border:1px solid #ccc;border-radius:8px;font:inherit;box-sizing:border-box;"></div>'
+            + '<div id="nbbu-up-list" style="flex:1;overflow:auto;padding:0 10px 6px;"></div>'
+            + '<div style="padding:10px 16px;border-top:1px solid rgba(0,0,0,.1);">'
+            + '<div id="nbbu-up-progress" style="font-size:12px;opacity:.75;min-height:16px;margin-bottom:8px;"></div>'
+            + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+            + '<button id="nbbu-up-harvest" type="button" style="flex:1;padding:9px;border:none;border-radius:8px;background:#8b5cf6;color:#fff;font-weight:700;cursor:pointer;">רענון פעילים</button>'
+            + '<button id="nbbu-up-deep" type="button" style="flex:1;padding:9px;border:1px solid #8b5cf6;border-radius:8px;background:transparent;color:#8b5cf6;font-weight:700;cursor:pointer;">סריקה עמוקה</button>'
+            + '</div></div></div>';
+        document.body.appendChild(host);
+        host.addEventListener('click', e => { if (e.target === host) closeModal(); });
+        host.querySelector('#nbbu-up-close').addEventListener('click', closeModal);
+        host.querySelector('#nbbu-up-search').addEventListener('input', updateList);
+        host.querySelector('#nbbu-up-harvest').addEventListener('click', () => runScan(() => harvestActive(5)));
+        host.querySelector('#nbbu-up-deep').addEventListener('click', () => runScan(deepScan));
+        setProgress(scanProgress);
+        refreshUI();
+    }
+    function closeModal() { modalOpen = false; const h = document.getElementById(UP_ID); if (h) h.remove(); }
+    function updateList() {
+        const host = document.getElementById(UP_ID);
+        if (!host) return;
+        const q = (host.querySelector('#nbbu-up-search').value || '').trim();
+        let users = scriptUsers();
+        if (q) users = users.filter(u => (u.name || '').includes(q) || (u.slug || '').includes(q));
+        users.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'he'));
+        host.querySelector('#nbbu-up-count').textContent = scriptUsers().length;
+        const label = u => /^uid /.test(u.name || '') ? 'טוען שם…' : u.name;
+        host.querySelector('#nbbu-up-list').innerHTML = users.length
+            ? users.map(u => '<a href="/user/' + encodeURIComponent(u.slug || '') + '" target="_blank" '
+                + 'style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;color:inherit;text-decoration:none;">'
+                + avatarHtml(u) + '<span style="font-weight:600;">' + escHtml(label(u)) + '</span></a>').join('')
+            : '<div style="padding:20px;text-align:center;opacity:.6;">אין עדיין. הרץ "רענון פעילים" או "סריקה עמוקה".</div>';
+        // מי שאין לו שם - נמשך אוטומטית ומתעדכן חי (בלי חסימה)
+        backfillMeta(scriptUsers().filter(u => needsMeta(u.uid)).map(u => u.uid));
+    }
+    function refreshUI() {
+        ensureButton();
+        const host = document.getElementById(UP_ID);
+        if (!host) return;
+        updateList();
+        const h = host.querySelector('#nbbu-up-harvest'), d = host.querySelector('#nbbu-up-deep');
+        if (h && d) {
+            h.textContent = scanBusy ? 'עצור' : 'רענון פעילים';
+            d.textContent = scanBusy ? 'עצור' : 'סריקה עמוקה';
+        }
+    }
+
     /* ---------- טוגלים גרפיים בפאנל ההגדרות המרכזי (Shadow DOM פתוח) ---------- */
     const CHECK_MINI = '<svg viewBox="0 0 24 24" width="10" height="10" fill="none">'
         + '<path d="M20 6L9 17l-5-5" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -33540,6 +33908,7 @@
             badgeChatTitles();
             applyUsersFilter();
             badgeUsersCards();
+            ensureButton();
             ensurePanelSettings();
             const vc = verifiedCount();
             if (vc !== lastVerifiedCount) {
@@ -33550,12 +33919,15 @@
     }
 
     function start() {
-        log('התחיל. סימן=' + [...MARKER].length + ' תווי-TAG, מאומתים במטמון=' + verifiedCount());
+        log('התחיל. סימן=' + [...MARKER].length + ' תווי רוחב-אפס, מאומתים במטמון=' + verifiedCount());
         addStyles();
         scheduleScan();
         const obs = new MutationObserver(() => scheduleScan());
         obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-        whenAppReady(firstRunEditLastPost);
+        whenAppReady(() => {
+            maybeAskCleanup();
+            setInterval(runCleanupSweep, 60000); // חידוש-עצמי אחרי נפילת-רשת, בלי צורך ברענון
+        });
     }
 
     // עוטפים את הרשת מיד (document-start) כדי לא לפספס שליחות מוקדמות
