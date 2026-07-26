@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeBB Unified – אוסף הכלים המאוחד
 // @namespace    https://mitmachim.top/nodebb-unified/
-// @version      2.1.0
+// @version      2.1.1
 // @description  מאחד את סקריפטי NodeBB המקוריים במודולים מבודדים עם פאנל ניהול מרכזי, גיבוי ואבחון
 // @author       מחברי הסקריפטים המקוריים
 // @updateURL    https://raw.githubusercontent.com/moishyf/NodeBB-Unified/main/NodeBB-Unified.user.js
@@ -25686,8 +25686,7 @@
         // הצגת חלונית מידע במעבר עכבר
         enableTooltip: true,
 
-        // דירוג חכם: משקלים וקבועים (ניתנים לשינוי ע"י המשתמש).
-        // ניקוד = רעננות^severity × Σ(משקל × אחוזון_רכיב). נרמול=אחוזון (עמיד לחריגים).
+        // דירוג משוכלל: יחס מוניטין/פוסטים בלבד, בריכוך בייסיאני (R + C·m)/(P + C).
         // הנוסחה משוכפלת ב-test/ranking.test.js - לעדכן את שניהם יחד.
         scoring: {
             // הדירוג המשוכלל = יחס מוניטין/פוסטים (כמו שקובע באתר), בריכוך בייסיאני
@@ -33122,18 +33121,20 @@
 
     const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
 
-    // מזריק את הסימן בסוף המילה הראשונה (לפני הרווח הראשון) - לא בסוף ההודעה, כדי לא
-    // לשבור ספויילר/מרקדאון סוגר. אם אין רווח (מילה אחת) - נופל לסוף. גם מנקה TAG ישן.
+    // מזריק את הסימן מיד אחרי רצף-האותיות/ספרות הראשון (בתוך המילה הראשונה של התוכן).
+    // כך הוא תמיד בין תווי-תוכן ולעולם לא נוגע בתוחם פתיחה/סגירה של מרקדאון - כולל
+    // ספוילר ||...|| (גם כשהוא כל ההודעה), הדגשות, כותרות, ציטוטים. גם מנקה TAG ישן.
+    const FIRST_WORD_RE = /[\p{L}\p{N}]+/u;
     function insertMarkerInto(str) {
         if (typeof str !== 'string' || !str) return str;
         const cleaned = stripLegacy(str);
         if (hasMarker(cleaned)) return cleaned; // idempotent
-        const m = cleaned.match(/\s/);
+        const m = cleaned.match(FIRST_WORD_RE);
         if (m) {
-            const i = m.index;
+            const i = m.index + m[0].length; // מיד אחרי המילה הראשונה
             return cleaned.slice(0, i) + MARKER + cleaned.slice(i);
         }
-        return cleaned + MARKER;
+        return cleaned + MARKER; // אין אותיות/ספרות (סמלים/אמוji בלבד) - נדיר
     }
 
     /* ---------- הזרקה לתוכן יוצא (fetch + XHR) ---------- */

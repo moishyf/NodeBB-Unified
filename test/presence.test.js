@@ -28,12 +28,13 @@ function decodeMarker(text) {
 const hasMarker = t => !!decodeMarker(t);
 const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
 
+const FIRST_WORD_RE = /[\p{L}\p{N}]+/u;
 function insertMarkerInto(str) {
     if (typeof str !== 'string' || !str) return str;
     const cleaned = stripLegacy(str);
     if (hasMarker(cleaned)) return cleaned;
-    const m = cleaned.match(/\s/);
-    if (m) { const i = m.index; return cleaned.slice(0, i) + MARKER + cleaned.slice(i); }
+    const m = cleaned.match(FIRST_WORD_RE);
+    if (m) { const i = m.index + m[0].length; return cleaned.slice(0, i) + MARKER + cleaned.slice(i); }
     return cleaned + MARKER;
 }
 
@@ -50,12 +51,16 @@ assert.deepStrictEqual(decodeMarker(MARKER), { version: 1 });
 assert.strictEqual(hasMarker('שלום עולם'), false, 'טקסט רגיל בלי סימן');
 assert.strictEqual(hasMarker('היי' + MARKER), true, 'מזהה סימן');
 
-// --- הזרקה: אחרי המילה הראשונה (לפני הרווח הראשון), לא בסוף => ספויילר-בסוף שורד ---
-const spoiler = 'תראו את זה >!סוד!<';
-const injected = insertMarkerInto(spoiler);
+// --- הזרקה אחרי המילה הראשונה (בתוך התוכן) => תוחם ספוילר בקצוות שורד ---
+const injected = insertMarkerInto('תראו את זה ||סוד||');
 assert.ok(hasMarker(injected), 'הוזרק סימן');
-assert.ok(injected.endsWith('>!סוד!<'), 'הסוף (הספויילר) לא נגע - הסימן לא בסוף');
-assert.ok(injected.startsWith('תראו' + MARKER + ' '), 'הסימן בסוף המילה הראשונה');
+assert.ok(injected.endsWith('||סוד||'), 'הספוילר בסוף לא נגע');
+assert.ok(injected.startsWith('תראו' + MARKER), 'הסימן אחרי המילה הראשונה');
+
+// המקרה הקריטי: ספוילר בלי רווח שהוא כל ההודעה - הסימן חייב להיכנס בפנים, לא לשבור ||..||
+const s2 = insertMarkerInto('||דוגמא||');
+assert.strictEqual(s2, '||דוגמא' + MARKER + '||', 'הסימן בתוך הספוילר, התוחמים שלמים');
+assert.ok(s2.startsWith('||') && s2.endsWith('||'), 'תוחמי ||..|| שלמים');
 
 // --- idempotent ---
 assert.strictEqual(insertMarkerInto(injected), injected, 'הזרקה כפולה נמנעת');
