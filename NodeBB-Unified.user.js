@@ -33230,6 +33230,16 @@
     }
 
     /* ---------- סריקת פוסטים/צ'אט לזיהוי הסימן ---------- */
+    // טקסט לזיהוי הסימן, ללא תוכן ציטוטים (blockquote): סימן בתוך ציטוט שייך למצוטט,
+    // לא לכותב - אחרת מי-שמצטט פוסט מסומן ייחשב בטעות למשתמש-סקריפט.
+    function markerText(el) {
+        if (!el) return '';
+        if (!el.querySelector('blockquote')) return el.textContent; // מהיר: אין ציטוט
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('blockquote').forEach(b => b.remove());
+        return clone.textContent;
+    }
+
     function scanContainer(root) {
         if (!(root instanceof Element) && root !== document) return;
         const scope = root === document ? document : root;
@@ -33239,7 +33249,7 @@
             const uid = post.getAttribute('data-uid');
             if (!uid || uid === '0') return;
             const body = post.querySelector('[component="post/content"]') || post;
-            recordPresence(uid, post.getAttribute('data-pid'), hasMarker(body.textContent));
+            recordPresence(uid, post.getAttribute('data-pid'), hasMarker(markerText(body)));
         });
 
         // הודעות צ'אט
@@ -33247,7 +33257,7 @@
             const host = msg.closest('[data-uid]') || msg.querySelector('[data-uid]');
             const uid = (host && host.getAttribute('data-uid')) || msg.getAttribute('data-uid');
             if (!uid || uid === '0') return;
-            recordPresence(uid, msg.getAttribute('data-mid'), hasMarker(msg.textContent));
+            recordPresence(uid, msg.getAttribute('data-mid'), hasMarker(markerText(msg)));
         });
     }
 
@@ -33418,6 +33428,51 @@
             log('ריצה-ראשונה: PUT עריכת פוסט ' + pid + ' -> ' + put.status);
             if (put.ok) GM_setValue(FIRSTRUN_KEY, true);
         } catch (e) { log('ריצה-ראשונה: שגיאה', e); }
+    }
+
+    /* ---------- ניקוי חד-פעמי: הסרת תווי-TAG ישנים מפוסטים שכבר נשלחו ---------- */
+    // תווי ה-TAG הישנים (בגרסאות קודמות) הוצגו כריבוע/הדגשה ושברו ספוילרים למי שאין לו הסקריפט.
+    const CLEANUP_KEY = 'nbbu_presence_legacy_cleanup_v1';
+    const CLEANUP_MAX = 30; // כמה פוסטים אחרונים לסרוק
+    const hasLegacy = str => typeof str === 'string' && /[\u{E0000}-\u{E007F}]/u.test(str);
+
+    async function cleanupLegacyPosts() {
+        if (!enabled || GM_getValue(CLEANUP_KEY, false)) return;
+        const user = W.app && W.app.user;
+        if (!user || !user.uid || !user.userslug) return;
+        try {
+            const resp = await W.fetch(
+                '/api/user/' + encodeURIComponent(user.userslug) + '/posts',
+                { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+            ).then(r => r.json());
+            const list = (resp && resp.posts) || [];
+            if (!list.length) { GM_setValue(CLEANUP_KEY, true); return; }
+
+            const csrf = await getCsrf();
+            if (!csrf) return; // ננסה שוב בפעם הבאה
+            let cleaned = 0;
+            for (const p of list.slice(0, CLEANUP_MAX)) {
+                const pid = p && p.pid;
+                if (!pid) continue;
+                // סינון מהיר לפי התוכן המרונדר בתשובה (אם קיים) - נמנע ממשיכת raw מיותרת
+                if (typeof p.content === 'string' && !hasLegacy(p.content)) continue;
+                const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
+                    headers: { Accept: 'application/json' }, credentials: 'same-origin',
+                }).then(r => r.json()).catch(() => null);
+                const raw = rawResp && rawResp.response && rawResp.response.content;
+                if (typeof raw !== 'string' || !hasLegacy(raw)) continue; // רק פוסטים עם TAG ישן
+                const fixed = insertMarkerInto(raw); // מנקה TAG + מוסיף סימן חדש (רוחב-אפס)
+                const put = await W.fetch('/api/v3/posts/' + pid, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ content: fixed }),
+                }).catch(() => null);
+                if (put && put.ok) cleaned += 1;
+            }
+            GM_setValue(CLEANUP_KEY, true);
+            log('ניקוי TAG ישן: תוקנו ' + cleaned + ' פוסטים');
+        } catch (e) { log('ניקוי: שגיאה', e); }
     }
 
     function whenAppReady(cb, tries = 40) {
@@ -33791,12 +33846,15 @@
     }
 
     function start() {
-        log('התחיל. סימן=' + [...MARKER].length + ' תווי-TAG, מאומתים במטמון=' + verifiedCount());
+        log('התחיל. סימן=' + [...MARKER].length + ' תווי רוחב-אפס, מאומתים במטמון=' + verifiedCount());
         addStyles();
         scheduleScan();
         const obs = new MutationObserver(() => scheduleScan());
         obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-        whenAppReady(firstRunEditLastPost);
+        whenAppReady(async () => {
+            await firstRunEditLastPost();
+            await cleanupLegacyPosts();
+        });
     }
 
     // עוטפים את הרשת מיד (document-start) כדי לא לפספס שליחות מוקדמות
