@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeBB Unified – אוסף הכלים המאוחד
 // @namespace    https://mitmachim.top/nodebb-unified/
-// @version      2.1.3
+// @version      2.2.0
 // @description  מאחד את סקריפטי NodeBB המקוריים במודולים מבודדים עם פאנל ניהול מרכזי, גיבוי ואבחון
 // @author       מחברי הסקריפטים המקוריים
 // @updateURL    https://raw.githubusercontent.com/moishyf/NodeBB-Unified/main/NodeBB-Unified.user.js
@@ -33323,6 +33323,26 @@
                 vertical-align: -0.12em !important;
             }
             .${CHAT_MARK_CLASS} svg { width: .66em !important; height: .66em !important; display: block !important; }
+
+            /* מודעת ההסכמה לניקוי */
+            #nbbu-cleanup-consent {
+                position: fixed !important; z-index: 2147483000 !important;
+                inset-inline-end: 18px !important; bottom: 18px !important;
+                max-width: 380px !important; font-family: inherit !important;
+            }
+            #nbbu-cleanup-consent .nbbu-cc-card {
+                background: var(--bs-body-bg, #fff) !important; color: var(--bs-body-color, #111) !important;
+                border: 1px solid rgba(139,92,246,.5) !important; border-top: 4px solid #8b5cf6 !important;
+                border-radius: 12px !important; box-shadow: 0 8px 30px rgba(0,0,0,.28) !important;
+                padding: 16px 18px !important;
+            }
+            #nbbu-cleanup-consent .nbbu-cc-title { font-weight: 800; font-size: 15px; margin-bottom: 8px; color: #8b5cf6; }
+            #nbbu-cleanup-consent .nbbu-cc-body { font-size: 13px; line-height: 1.6; }
+            #nbbu-cleanup-consent .nbbu-cc-btns { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+            #nbbu-cleanup-consent button { border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 700; cursor: pointer; font-size: 13px; }
+            #nbbu-cleanup-consent .nbbu-cc-yes { background: #8b5cf6; color: #fff; }
+            #nbbu-cleanup-consent .nbbu-cc-maybe { background: rgba(127,127,127,.15); color: inherit; }
+            #nbbu-cleanup-consent .nbbu-cc-no { background: transparent; color: inherit; opacity: .65; }
         `;
         (document.head || document.documentElement).appendChild(style);
     }
@@ -33411,8 +33431,17 @@
         });
     }
 
-    /* ---------- ריצה ראשונה: עריכת הפוסט האחרון להוספת הסימן (חיווי מיידי) ---------- */
-    const FIRSTRUN_KEY = 'nbbu_presence_firstrun_v3'; // v3: איפוס - נשא סימן חדש (רוחב-אפס) + ניקוי TAG ישן
+    /* ---------- ניקוי פוסטים מלא (בהסכמה) + מעבר לסימן החדש ---------- */
+    // חד-פעמי-פר-התקנה: מודעה צפה מסבירה; ב"כן" רץ בשקט מוחלט ברקע על *כל* הפוסטים
+    // (מנקה תווי-TAG ישנים + מוסיף את הסימן החדש). מתחדש לבד אחרי רענון/נפילת-רשת.
+    const CHOICE_KEY = 'nbbu_cleanup_choice_v1';   // 'yes' | 'no' (ריק = לשאול)
+    const DONE_KEY = 'nbbu_cleanup_done_v1';        // הסריקה הושלמה
+    const PAGE_KEY = 'nbbu_cleanup_page_v1';        // עמוד הבא לעיבוד (נקודת-חידוש)
+    const EDIT_DELAY = 1500;                        // ms בין עריכות (הגנה מ-rate-limit)
+    let sweepRunning = false;
+    let snoozed = false;                            // "אולי אחר כך" - עד הטעינה הבאה
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
 
     async function getCsrf() {
         try {
@@ -33423,85 +33452,100 @@
         } catch { return null; }
     }
 
-    async function firstRunEditLastPost() {
-        if (!enabled) { log('ריצה-ראשונה: מכובה'); return; }
-        if (GM_getValue(FIRSTRUN_KEY, false)) { log('ריצה-ראשונה: כבר בוצעה בעבר'); return; }
-        const user = W.app && W.app.user;
-        if (!user || !user.uid || !user.userslug) { log('ריצה-ראשונה: אין משתמש מחובר'); return; }
-        try {
-            const posts = await W.fetch(
-                '/api/user/' + encodeURIComponent(user.userslug) + '/posts',
-                { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
-            ).then(r => r.json());
-            const pid = posts && posts.posts && posts.posts[0] && posts.posts[0].pid;
-            if (!pid) { log('ריצה-ראשונה: לא נמצאו פוסטים למשתמש', posts); GM_setValue(FIRSTRUN_KEY, true); return; }
-            log('ריצה-ראשונה: פוסט אחרון pid=' + pid);
-
-            // תוכן גולמי (markdown) - חובה כדי לא להשחית את הפוסט
-            const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
-                headers: { Accept: 'application/json' }, credentials: 'same-origin',
-            }).then(r => r.json());
-            const raw = rawResp && rawResp.response && rawResp.response.content;
-            if (typeof raw !== 'string') { log('ריצה-ראשונה: לא התקבל תוכן גולמי', rawResp); return; }
-            const marked = insertMarkerInto(raw); // מנקה TAG ישן + מוסיף סימן חדש (רוחב-אפס, לא בסוף)
-            if (marked === raw) { log('ריצה-ראשונה: הפוסט כבר מסומן'); GM_setValue(FIRSTRUN_KEY, true); return; }
-
-            const csrf = await getCsrf();
-            if (!csrf) { log('ריצה-ראשונה: אין csrf token'); return; }
-            const put = await W.fetch('/api/v3/posts/' + pid, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
-                credentials: 'same-origin',
-                body: JSON.stringify({ content: marked }),
-            });
-            log('ריצה-ראשונה: PUT עריכת פוסט ' + pid + ' -> ' + put.status);
-            if (put.ok) GM_setValue(FIRSTRUN_KEY, true);
-        } catch (e) { log('ריצה-ראשונה: שגיאה', e); }
+    async function editPost(pid, content, csrf) {
+        return W.fetch('/api/v3/posts/' + pid, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ content }),
+        }).catch(() => null);
     }
 
-    /* ---------- ניקוי חד-פעמי: הסרת תווי-TAG ישנים מפוסטים שכבר נשלחו ---------- */
-    // תווי ה-TAG הישנים (בגרסאות קודמות) הוצגו כריבוע/הדגשה ושברו ספוילרים למי שאין לו הסקריפט.
-    const CLEANUP_KEY = 'nbbu_presence_legacy_cleanup_v1';
-    const CLEANUP_MAX = 30; // כמה פוסטים אחרונים לסרוק
-    const hasLegacy = str => typeof str === 'string' && /[\u{E0000}-\u{E007F}]/u.test(str);
-
-    async function cleanupLegacyPosts() {
-        if (!enabled || GM_getValue(CLEANUP_KEY, false)) return;
+    // סריקה עמוד-אחר-עמוד (חדש->ישן) על כל פוסטי המשתמש; עורכת רק מה שצריך שינוי.
+    // כל עמוד נשמר ב-GM, אז רענון/נפילת-רשת ממשיכים בדיוק מאותה נקודה.
+    async function runCleanupSweep() {
+        if (sweepRunning || !enabled) return;
+        if (GM_getValue(CHOICE_KEY, '') !== 'yes' || GM_getValue(DONE_KEY, false)) return;
         const user = W.app && W.app.user;
         if (!user || !user.uid || !user.userslug) return;
+        const csrf = await getCsrf();
+        if (!csrf) return; // ננסה שוב בטיק הבא
+        sweepRunning = true;
+        let edited = 0;
         try {
-            const resp = await W.fetch(
-                '/api/user/' + encodeURIComponent(user.userslug) + '/posts',
-                { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
-            ).then(r => r.json());
-            const list = (resp && resp.posts) || [];
-            if (!list.length) { GM_setValue(CLEANUP_KEY, true); return; }
-
-            const csrf = await getCsrf();
-            if (!csrf) return; // ננסה שוב בפעם הבאה
-            let cleaned = 0;
-            for (const p of list.slice(0, CLEANUP_MAX)) {
-                const pid = p && p.pid;
-                if (!pid) continue;
-                // סינון מהיר לפי התוכן המרונדר בתשובה (אם קיים) - נמנע ממשיכת raw מיותרת
-                if (typeof p.content === 'string' && !hasLegacy(p.content)) continue;
-                const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
-                    headers: { Accept: 'application/json' }, credentials: 'same-origin',
-                }).then(r => r.json()).catch(() => null);
-                const raw = rawResp && rawResp.response && rawResp.response.content;
-                if (typeof raw !== 'string' || !hasLegacy(raw)) continue; // רק פוסטים עם TAG ישן
-                const fixed = insertMarkerInto(raw); // מנקה TAG + מוסיף סימן חדש (רוחב-אפס)
-                const put = await W.fetch('/api/v3/posts/' + pid, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
-                    credentials: 'same-origin',
-                    body: JSON.stringify({ content: fixed }),
-                }).catch(() => null);
-                if (put && put.ok) cleaned += 1;
+            let page = Number(GM_getValue(PAGE_KEY, 1)) || 1;
+            for (;;) {
+                const resp = await W.fetch(
+                    '/api/user/' + encodeURIComponent(user.userslug) + '/posts?page=' + page,
+                    { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+                ).then(r => r.json()).catch(() => null);
+                if (!resp) break; // רשת נפלה - עוצרים; page שמור, נמשיך אחר כך
+                const list = resp.posts || [];
+                const pageCount = (resp.pagination && resp.pagination.pageCount) || page;
+                for (const p of list) {
+                    const pid = p && p.pid;
+                    if (!pid) continue;
+                    const rawResp = await W.fetch('/api/v3/posts/' + pid + '/raw', {
+                        headers: { Accept: 'application/json' }, credentials: 'same-origin',
+                    }).then(r => r.json()).catch(() => null);
+                    const raw = rawResp && rawResp.response && rawResp.response.content;
+                    if (typeof raw !== 'string') continue;
+                    const fixed = insertMarkerInto(raw);
+                    if (fixed === raw) continue; // כבר תקין / רק-קישור - לא נוגעים
+                    const put = await editPost(pid, fixed, csrf);
+                    if (put && put.ok) edited += 1;
+                    await sleep(EDIT_DELAY);
+                }
+                if (page >= pageCount) { GM_setValue(DONE_KEY, true); log('ניקוי מלא: הושלם (' + edited + ' נערכו)'); break; }
+                page += 1;
+                GM_setValue(PAGE_KEY, page);
             }
-            GM_setValue(CLEANUP_KEY, true);
-            log('ניקוי TAG ישן: תוקנו ' + cleaned + ' פוסטים');
-        } catch (e) { log('ניקוי: שגיאה', e); }
+        } catch (e) { log('ניקוי מלא: שגיאה', e); }
+        finally { sweepRunning = false; }
+    }
+
+    function showCleanupConsent() {
+        if (document.getElementById('nbbu-cleanup-consent')) return;
+        const box = document.createElement('div');
+        box.id = 'nbbu-cleanup-consent';
+        box.dir = 'rtl';
+        box.innerHTML =
+            '<div class="nbbu-cc-card">'
+          + '<div class="nbbu-cc-title">ניקוי הפוסטים שלך - NodeBB Unified</div>'
+          + '<div class="nbbu-cc-body">'
+          + 'גרסאות קודמות של הסקריפט הוסיפו סימן נסתר לפוסטים שלך (לזיהוי מי מפעיל את הסקריפט). '
+          + 'אצל חלק מהקוראים שאין להם הסקריפט זה הופיע כריבוע קטן, או שבר ספוילר בסוף הודעה.<br><br>'
+          + 'הגרסה החדשה משתמשת בסימן משופר, בלתי-נראה לגמרי. אפשר לעבור על <b>כל הפוסטים שלך</b>, '
+          + 'לנקות את הסימן הישן ולהחליף בחדש.<br><br>'
+          + '<b>שים לב:</b> הפעולה מוסיפה תגית "נערך" לכל פוסט. היא רצה בשקט ברקע וממשיכה מאליה '
+          + 'גם אחרי רענון או ניתוק-רשת.'
+          + '</div>'
+          + '<div class="nbbu-cc-btns">'
+          + '<button class="nbbu-cc-yes">כן, נקה</button>'
+          + '<button class="nbbu-cc-maybe">אולי אחר כך</button>'
+          + '<button class="nbbu-cc-no">לא</button>'
+          + '</div></div>';
+        const close = () => box.remove();
+        box.querySelector('.nbbu-cc-yes').addEventListener('click', () => {
+            GM_setValue(CHOICE_KEY, 'yes'); close(); runCleanupSweep();
+        });
+        box.querySelector('.nbbu-cc-no').addEventListener('click', () => {
+            GM_setValue(CHOICE_KEY, 'no'); close();
+        });
+        box.querySelector('.nbbu-cc-maybe').addEventListener('click', () => {
+            snoozed = true; close(); // נשאל שוב בטעינה הבאה
+        });
+        document.body.appendChild(box);
+    }
+
+    function maybeAskCleanup() {
+        if (!enabled || snoozed) return;
+        if (GM_getValue(CHOICE_KEY, '') === 'no' || GM_getValue(DONE_KEY, false)) return;
+        if (GM_getValue(CHOICE_KEY, '') === 'yes') { runCleanupSweep(); return; } // אושר - להמשיך
+        const user = W.app && W.app.user;
+        if (!user || !user.uid) return;
+        if (Number(user.postcount) === 0) { GM_setValue(DONE_KEY, true); return; } // אין מה לנקות
+        showCleanupConsent();
     }
 
     function whenAppReady(cb, tries = 40) {
@@ -33880,9 +33924,9 @@
         scheduleScan();
         const obs = new MutationObserver(() => scheduleScan());
         obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-        whenAppReady(async () => {
-            await firstRunEditLastPost();
-            await cleanupLegacyPosts();
+        whenAppReady(() => {
+            maybeAskCleanup();
+            setInterval(runCleanupSweep, 60000); // חידוש-עצמי אחרי נפילת-רשת, בלי צורך ברענון
         });
     }
 
