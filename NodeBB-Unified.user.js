@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeBB Unified – אוסף הכלים המאוחד
 // @namespace    https://mitmachim.top/nodebb-unified/
-// @version      2.1.1
+// @version      2.1.2
 // @description  מאחד את סקריפטי NodeBB המקוריים במודולים מבודדים עם פאנל ניהול מרכזי, גיבוי ואבחון
 // @author       מחברי הסקריפטים המקוריים
 // @updateURL    https://raw.githubusercontent.com/moishyf/NodeBB-Unified/main/NodeBB-Unified.user.js
@@ -33121,20 +33121,31 @@
 
     const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
 
-    // מזריק את הסימן מיד אחרי רצף-האותיות/ספרות הראשון (בתוך המילה הראשונה של התוכן).
-    // כך הוא תמיד בין תווי-תוכן ולעולם לא נוגע בתוחם פתיחה/סגירה של מרקדאון - כולל
-    // ספוילר ||...|| (גם כשהוא כל ההודעה), הדגשות, כותרות, ציטוטים. גם מנקה TAG ישן.
-    const FIRST_WORD_RE = /[\p{L}\p{N}]+/u;
+    // מזריק את הסימן מיד אחרי רצף-האותיות/ספרות הראשון שאינו חלק מקישור/מוזכר.
+    // כך הוא תמיד בין תווי-תוכן ולעולם לא נוגע בתוחם מרקדאון (ספוילר ||..|| גם כשהוא כל
+    // ההודעה, הדגשות, כותרות) ולא נבלע לתוך URL. אם אין מקום בטוח (הודעה שהיא רק קישור) -
+    // לא מסמנים בכלל (עדיף בלי חיווי מאשר לשבור קישור). גם מנקה TAG ישן.
+    // טווחים "לא בטוחים": URL, www, קישור-מרקדאון [..](..), מוזכר @.., האשטאג #..
+    const UNSAFE_RE = /(https?:\/\/\S+|www\.\S+|\[[^\]]*\]\([^)]*\)|[@#][^\s@#]+)/gi;
+    const RUN_RE = /[\p{L}\p{N}]+/gu;
     function insertMarkerInto(str) {
         if (typeof str !== 'string' || !str) return str;
         const cleaned = stripLegacy(str);
         if (hasMarker(cleaned)) return cleaned; // idempotent
-        const m = cleaned.match(FIRST_WORD_RE);
-        if (m) {
-            const i = m.index + m[0].length; // מיד אחרי המילה הראשונה
-            return cleaned.slice(0, i) + MARKER + cleaned.slice(i);
+
+        const unsafe = [];
+        UNSAFE_RE.lastIndex = 0;
+        for (let u; (u = UNSAFE_RE.exec(cleaned));) unsafe.push([u.index, u.index + u[0].length]);
+        const inUnsafe = i => unsafe.some(([a, b]) => i > a && i <= b);
+
+        RUN_RE.lastIndex = 0;
+        for (let m; (m = RUN_RE.exec(cleaned));) {
+            const end = m.index + m[0].length;
+            if (!inUnsafe(m.index) && !inUnsafe(end)) {
+                return cleaned.slice(0, end) + MARKER + cleaned.slice(end);
+            }
         }
-        return cleaned + MARKER; // אין אותיות/ספרות (סמלים/אמוji בלבד) - נדיר
+        return cleaned; // אין מקום בטוח (הכל קישור/סמלים) - לא מסמנים
     }
 
     /* ---------- הזרקה לתוכן יוצא (fetch + XHR) ---------- */

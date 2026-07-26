@@ -28,14 +28,22 @@ function decodeMarker(text) {
 const hasMarker = t => !!decodeMarker(t);
 const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
 
-const FIRST_WORD_RE = /[\p{L}\p{N}]+/u;
+const UNSAFE_RE = /(https?:\/\/\S+|www\.\S+|\[[^\]]*\]\([^)]*\)|[@#][^\s@#]+)/gi;
+const RUN_RE = /[\p{L}\p{N}]+/gu;
 function insertMarkerInto(str) {
     if (typeof str !== 'string' || !str) return str;
     const cleaned = stripLegacy(str);
     if (hasMarker(cleaned)) return cleaned;
-    const m = cleaned.match(FIRST_WORD_RE);
-    if (m) { const i = m.index + m[0].length; return cleaned.slice(0, i) + MARKER + cleaned.slice(i); }
-    return cleaned + MARKER;
+    const unsafe = [];
+    UNSAFE_RE.lastIndex = 0;
+    for (let u; (u = UNSAFE_RE.exec(cleaned));) unsafe.push([u.index, u.index + u[0].length]);
+    const inUnsafe = i => unsafe.some(([a, b]) => i > a && i <= b);
+    RUN_RE.lastIndex = 0;
+    for (let m; (m = RUN_RE.exec(cleaned));) {
+        const end = m.index + m[0].length;
+        if (!inUnsafe(m.index) && !inUnsafe(end)) return cleaned.slice(0, end) + MARKER + cleaned.slice(end);
+    }
+    return cleaned;
 }
 
 const WRITE_RE = /\/api\/v3\/(topics(\/\d+)?|posts\/\d+|chats\/\d+)\/?(\?.*)?$/;
@@ -72,8 +80,21 @@ const fixed = insertMarkerInto(legacy);
 assert.ok(!LEGACY_RE.test(fixed), 'תווי TAG ישנים נוקו');
 assert.ok(hasMarker(fixed), 'סימן חדש נוסף במקום');
 
-// --- מילה אחת בלי רווח => נופל לסוף ---
+// --- מילה אחת בלי רווח => הסימן אחריה ---
 assert.ok(insertMarkerInto('שלום').startsWith('שלום' + MARKER), 'מילה אחת: הסימן אחריה');
+
+// --- קישורים: הסימן לעולם לא בתוך/צמוד ל-URL ---
+const urlOnly = 'https://example.com/foo?a=1';
+assert.strictEqual(insertMarkerInto(urlOnly), urlOnly, 'הודעה שהיא רק קישור - לא נגעים (אין מקום בטוח)');
+const urlEnd = insertMarkerInto('תראו https://example.com');
+assert.ok(urlEnd.endsWith('https://example.com'), 'קישור בסוף שלם');
+assert.ok(urlEnd.startsWith('תראו' + MARKER), 'הסימן אחרי המילה הראשונה, לא בקישור');
+const urlStart = insertMarkerInto('https://example.com וזהו');
+assert.ok(urlStart.startsWith('https://example.com'), 'קישור בהתחלה שלם (הסימן לא נכנס לתוכו)');
+assert.ok(hasMarker(urlStart) && urlStart.includes('וזהו' + MARKER), 'הסימן אחרי מילה בטוחה');
+const mdLink = insertMarkerInto('[פוסט](https://mitmachim.top/post/1)');
+assert.ok(mdLink.includes('](https://mitmachim.top/post/1)'), 'קישור-מרקדאון לא נשבר');
+assert.strictEqual(mdLink, '[פוסט](https://mitmachim.top/post/1)', 'קישור-מרקדאון בלבד - לא נגעים');
 
 // --- זיהוי endpoints של write (ללא שינוי) ---
 ['/api/v3/topics', '/api/v3/topics/123', '/api/v3/posts/456', '/api/v3/chats/789'].forEach(u =>
