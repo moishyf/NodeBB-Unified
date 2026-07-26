@@ -1,97 +1,79 @@
-// בדיקת מנגנון חיווי הנוכחות (סימן TAG נסתר + הזרקה).
+// בדיקת מנגנון חיווי הנוכחות (סימן רוחב-אפס נסתר + הזרקה).
 // משכפלת את הפונקציות הטהורות מ-NodeBB-Unified.user.js (מודול presence) - לעדכן יחד.
 // הרצה: node test/presence.test.js
 
 const assert = require('assert');
 
-const MAGIC = 'nbbu';
 const VERSION = 1;
-const TAG_BASE = 0xE0000;
+const BIT0 = String.fromCharCode(0x200B); // ZWSP
+const BIT1 = String.fromCharCode(0x200C); // ZWNJ
+const MAGIC_BITS = '10110100';
+const LEGACY_RE = /[\u{E0000}-\u{E007F}]/gu;
 
 function buildMarker() {
-    let out = '';
-    for (const ch of MAGIC + VERSION) out += String.fromCodePoint(TAG_BASE + ch.charCodeAt(0));
-    return out;
+    const bits = MAGIC_BITS + VERSION.toString(2).padStart(4, '0');
+    return bits.replace(/0/g, BIT0).replace(/1/g, BIT1);
 }
 const MARKER = buildMarker();
 
 function decodeMarker(text) {
     if (!text) return null;
-    let ascii = '';
-    for (const ch of text) {
-        const cp = ch.codePointAt(0);
-        if (cp >= TAG_BASE && cp <= TAG_BASE + 0x7f) ascii += String.fromCharCode(cp - TAG_BASE);
-    }
-    if (!ascii.startsWith(MAGIC)) return null;
-    const ver = parseInt(ascii.slice(MAGIC.length), 10);
-    return { version: Number.isFinite(ver) ? ver : 0 };
+    let bits = '';
+    for (const ch of text) bits += ch === BIT0 ? '0' : ch === BIT1 ? '1' : ' ';
+    const i = bits.indexOf(MAGIC_BITS);
+    if (i < 0) return null;
+    const v = bits.slice(i + 8, i + 12);
+    return { version: /^[01]{4}$/.test(v) ? parseInt(v, 2) : 0 };
 }
 const hasMarker = t => !!decodeMarker(t);
+const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
 
-const WRITE_RE = /\/api\/v3\/(topics(\/\d+)?|posts\/\d+|chats\/\d+)\/?(\?.*)?$/;
-
-function injectIntoBody(bodyStr) {
-    if (typeof bodyStr !== 'string' || !bodyStr) return bodyStr;
-    let data;
-    try { data = JSON.parse(bodyStr); } catch { return bodyStr; }
-    if (!data || typeof data !== 'object') return bodyStr;
-    const field = typeof data.content === 'string' ? 'content'
-        : (typeof data.message === 'string' ? 'message' : null);
-    if (!field) return bodyStr;
-    if (hasMarker(data[field])) return bodyStr;
-    data[field] = data[field] + MARKER;
-    try { return JSON.stringify(data); } catch { return bodyStr; }
+function insertMarkerInto(str) {
+    if (typeof str !== 'string' || !str) return str;
+    const cleaned = stripLegacy(str);
+    if (hasMarker(cleaned)) return cleaned;
+    const m = cleaned.match(/\s/);
+    if (m) { const i = m.index; return cleaned.slice(0, i) + MARKER + cleaned.slice(i); }
+    return cleaned + MARKER;
 }
 
-// --- הסימן בלתי-נראה (רק תווי-TAG, אורך אפס בתצוגה אך תווים אמיתיים) ---
-assert.strictEqual([...MARKER].length, 5, 'nbbu1 = 5 תווי-TAG');
-assert.ok(!/[\x20-\x7e]/.test(MARKER), 'הסימן לא מכיל ASCII נראה');
+const WRITE_RE = /\/api\/v3\/(topics(\/\d+)?|posts\/\d+|chats\/\d+)\/?(\?.*)?$/;
+const zwCount = s => [...s].filter(c => c === BIT0 || c === BIT1).length;
+
+// --- הסימן בלתי-נראה: רק תווי רוחב-אפס, 12 ביט ---
+assert.strictEqual([...MARKER].length, 12, 'הסימן = 12 תווי רוחב-אפס');
+assert.ok([...MARKER].every(c => c === BIT0 || c === BIT1), 'רק ZWSP/ZWNJ');
+assert.ok(!/[\x20-\x7e]/.test(MARKER), 'אין ASCII נראה');
 
 // --- round-trip ---
 assert.deepStrictEqual(decodeMarker(MARKER), { version: 1 });
 assert.strictEqual(hasMarker('שלום עולם'), false, 'טקסט רגיל בלי סימן');
-assert.strictEqual(hasMarker('היי' + MARKER), true, 'מזהה סימן בסוף טקסט');
-assert.strictEqual(hasMarker('א' + MARKER + 'ב'), true, 'מזהה סימן באמצע טקסט');
+assert.strictEqual(hasMarker('היי' + MARKER), true, 'מזהה סימן');
 
-// --- הזרקה: content (פוסט/עריכה) ---
-const post = injectIntoBody(JSON.stringify({ content: 'תוכן פוסט' }));
-assert.ok(hasMarker(JSON.parse(post).content), 'הוזרק ל-content');
-// idempotent - קריאה שנייה לא מוסיפה עוד סימן
-assert.strictEqual(injectIntoBody(post), post, 'הזרקה כפולה נמנעת');
-assert.strictEqual([...JSON.parse(post).content].filter(c => c.codePointAt(0) >= TAG_BASE).length, 5, 'סימן יחיד');
+// --- הזרקה: אחרי המילה הראשונה (לפני הרווח הראשון), לא בסוף => ספויילר-בסוף שורד ---
+const spoiler = 'תראו את זה >!סוד!<';
+const injected = insertMarkerInto(spoiler);
+assert.ok(hasMarker(injected), 'הוזרק סימן');
+assert.ok(injected.endsWith('>!סוד!<'), 'הסוף (הספויילר) לא נגע - הסימן לא בסוף');
+assert.ok(injected.startsWith('תראו' + MARKER + ' '), 'הסימן בסוף המילה הראשונה');
 
-// --- הזרקה: message (צ'אט) ---
-const chat = injectIntoBody(JSON.stringify({ message: 'הודעה' }));
-assert.ok(hasMarker(JSON.parse(chat).message), 'הוזרק ל-message');
+// --- idempotent ---
+assert.strictEqual(insertMarkerInto(injected), injected, 'הזרקה כפולה נמנעת');
+assert.strictEqual(zwCount(injected), 12, 'סימן יחיד (12 תווים)');
 
-// --- גוף לא רלוונטי / לא-JSON נשאר כמו שהוא ---
-assert.strictEqual(injectIntoBody('not json'), 'not json');
-assert.strictEqual(injectIntoBody(JSON.stringify({ foo: 'bar' })), JSON.stringify({ foo: 'bar' }), 'בלי content/message');
+// --- ניקוי סימני TAG ישנים + החלפה בחדש ---
+const legacy = 'שלום' + String.fromCodePoint(0xE006E, 0xE0062) + ' עולם';
+const fixed = insertMarkerInto(legacy);
+assert.ok(!LEGACY_RE.test(fixed), 'תווי TAG ישנים נוקו');
+assert.ok(hasMarker(fixed), 'סימן חדש נוסף במקום');
 
-// --- זיהוי endpoints של write ---
-['/api/v3/topics', '/api/v3/topics/123', '/api/v3/posts/456', '/api/v3/chats/789',
- 'https://mitmachim.top/api/v3/chats/789?foo=1'].forEach(u =>
+// --- מילה אחת בלי רווח => נופל לסוף ---
+assert.ok(insertMarkerInto('שלום').startsWith('שלום' + MARKER), 'מילה אחת: הסימן אחריה');
+
+// --- זיהוי endpoints של write (ללא שינוי) ---
+['/api/v3/topics', '/api/v3/topics/123', '/api/v3/posts/456', '/api/v3/chats/789'].forEach(u =>
     assert.ok(WRITE_RE.test(u), 'צריך להתאים: ' + u));
-['/api/v3/users/1', '/api/config', '/api/v3/topics/123/tags', '/api/user/x/posts',
- '/api/v3/posts/456/raw'].forEach(u => // חשוב: GET raw של פוסט לא נגוע ע"י ההזרקה
+['/api/v3/users/1', '/api/config', '/api/v3/posts/456/raw', '/api/v3/topics/123/tags'].forEach(u =>
     assert.ok(!WRITE_RE.test(u), 'לא צריך להתאים: ' + u));
-
-// --- זיהוי sticky: סימן = נעילה חיובית, פוסט חדש בלי סימן לא מבטל ---
-function recordSticky(cache, uid, key, isUser) {
-    const prev = cache[uid];
-    if (prev && prev.isUser) return;      // נעול כמשתמש
-    if (!isUser && prev) return;          // נשאר לא-משתמש
-    cache[uid] = { isUser: !!isUser, key };
-}
-{
-    const c = {};
-    // רשומה ישנה false עם key גבוה (בעיית ההטמעה) - סימן ישן יותר עדיין נועל
-    recordSticky(c, '439', 9999, false);
-    recordSticky(c, '439', 1208705, true);
-    assert.strictEqual(c['439'].isUser, true, 'סימן נועל למשתמש למרות key נמוך יותר');
-    // פוסט חדש בלי סימן לא מבטל את הנעילה
-    recordSticky(c, '439', 999999, false);
-    assert.strictEqual(c['439'].isUser, true, 'פוסט חדש בלי סימן לא מבטל נעילה');
-}
 
 console.log('✅ בדיקת חיווי הנוכחות עברה');

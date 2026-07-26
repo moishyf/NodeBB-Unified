@@ -33078,7 +33078,6 @@
 
     const MAGIC = 'nbbu';
     const VERSION = 1;
-    const TAG_BASE = 0xE0000; // כל תו ASCII X מקודד כ-U+E0000+X (בלתי-נראה, שורד את הסניטייזר)
 
     const ENABLED_KEY = 'nbbu_presence_enabled_v1';
     const CACHE_KEY = 'nbbu_presence_cache_v2'; // { uid: { isUser, key } }  key=pid/mid אחרון שנראה (v2: איפוס מטמון ישן)
@@ -33093,31 +33092,49 @@
     const log = (...a) => { if (DEBUG) console.log('%c[NBBU presence]', 'color:#8b5cf6;font-weight:700', ...a); };
 
     /* ---------- קידוד/פענוח הסימן ---------- */
-    // הנוסחה: magic+version כמחרוזת ASCII, כל תו -> תו-TAG. לעתיד אפשר להוסיף ".payload".
+    // נשא = רצף תווי רוחב-אפס: ZWSP=0, ZWNJ=1. שניהם נראים "כלום" בכל דפדפן/פונט,
+    // בניגוד לבלוק ה-TAG (U+E00xx) שהוצג כריבוע-tofu אצל חלק מהמשתמשים.
+    // מקודד חתימה קבועה (8 ביט, נדירה בטבע) + גרסה (4 ביט).
+    const BIT0 = String.fromCharCode(0x200B); // ZWSP
+    const BIT1 = String.fromCharCode(0x200C); // ZWNJ
+    const MAGIC_BITS = '10110100';
+    const LEGACY_RE = /[\u{E0000}-\u{E007F}]/gu; // סימני TAG ישנים - לניקוי
+
     function buildMarker() {
-        const s = MAGIC + VERSION; // "nbbu1"
-        let out = '';
-        for (const ch of s) {
-            out += String.fromCodePoint(TAG_BASE + ch.charCodeAt(0));
-        }
-        return out;
+        const bits = MAGIC_BITS + VERSION.toString(2).padStart(4, '0'); // 12 ביט
+        return bits.replace(/0/g, BIT0).replace(/1/g, BIT1);
     }
     const MARKER = buildMarker();
 
     function decodeMarker(text) {
         if (!text) return null;
-        let ascii = '';
+        // תווי רוחב-אפס -> ביטים; כל תו אחר מנתק את הרצף
+        let bits = '';
         for (const ch of text) {
-            const cp = ch.codePointAt(0);
-            if (cp >= TAG_BASE && cp <= TAG_BASE + 0x7f) {
-                ascii += String.fromCharCode(cp - TAG_BASE);
-            }
+            bits += ch === BIT0 ? '0' : ch === BIT1 ? '1' : ' ';
         }
-        if (!ascii.startsWith(MAGIC)) return null;
-        const ver = parseInt(ascii.slice(MAGIC.length), 10);
-        return { version: Number.isFinite(ver) ? ver : 0 };
+        const i = bits.indexOf(MAGIC_BITS);
+        if (i < 0) return null;
+        const v = bits.slice(i + 8, i + 12);
+        return { version: /^[01]{4}$/.test(v) ? parseInt(v, 2) : 0 };
     }
     const hasMarker = text => !!decodeMarker(text);
+
+    const stripLegacy = str => (typeof str === 'string' ? str.replace(LEGACY_RE, '') : str);
+
+    // מזריק את הסימן בסוף המילה הראשונה (לפני הרווח הראשון) - לא בסוף ההודעה, כדי לא
+    // לשבור ספויילר/מרקדאון סוגר. אם אין רווח (מילה אחת) - נופל לסוף. גם מנקה TAG ישן.
+    function insertMarkerInto(str) {
+        if (typeof str !== 'string' || !str) return str;
+        const cleaned = stripLegacy(str);
+        if (hasMarker(cleaned)) return cleaned; // idempotent
+        const m = cleaned.match(/\s/);
+        if (m) {
+            const i = m.index;
+            return cleaned.slice(0, i) + MARKER + cleaned.slice(i);
+        }
+        return cleaned + MARKER;
+    }
 
     /* ---------- הזרקה לתוכן יוצא (fetch + XHR) ---------- */
     // עורך רק את גוף ה-write-API של NodeBB: content (פוסט/נושא/עריכה) או message (צ'אט).
@@ -33137,9 +33154,10 @@
             ? 'content'
             : (typeof data.message === 'string' ? 'message' : null);
         if (!field) return bodyStr;
-        if (hasMarker(data[field])) return bodyStr; // idempotent
 
-        data[field] = data[field] + MARKER;
+        const after = insertMarkerInto(data[field]);
+        if (after === data[field]) return bodyStr; // כבר מסומן / לא השתנה
+        data[field] = after;
         log('הוזרק סימן ל-' + field + ' (fetch/XHR)');
         try {
             return JSON.stringify(data);
@@ -33354,7 +33372,7 @@
     }
 
     /* ---------- ריצה ראשונה: עריכת הפוסט האחרון להוספת הסימן (חיווי מיידי) ---------- */
-    const FIRSTRUN_KEY = 'nbbu_presence_firstrun_v2'; // v2: איפוס כדי לנסות שוב את עריכת-הפוסט
+    const FIRSTRUN_KEY = 'nbbu_presence_firstrun_v3'; // v3: איפוס - נשא סימן חדש (רוחב-אפס) + ניקוי TAG ישן
 
     async function getCsrf() {
         try {
@@ -33385,7 +33403,8 @@
             }).then(r => r.json());
             const raw = rawResp && rawResp.response && rawResp.response.content;
             if (typeof raw !== 'string') { log('ריצה-ראשונה: לא התקבל תוכן גולמי', rawResp); return; }
-            if (hasMarker(raw)) { log('ריצה-ראשונה: הפוסט כבר מסומן'); GM_setValue(FIRSTRUN_KEY, true); return; }
+            const marked = insertMarkerInto(raw); // מנקה TAG ישן + מוסיף סימן חדש (רוחב-אפס, לא בסוף)
+            if (marked === raw) { log('ריצה-ראשונה: הפוסט כבר מסומן'); GM_setValue(FIRSTRUN_KEY, true); return; }
 
             const csrf = await getCsrf();
             if (!csrf) { log('ריצה-ראשונה: אין csrf token'); return; }
@@ -33393,7 +33412,7 @@
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrf, Accept: 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify({ content: raw + MARKER }),
+                body: JSON.stringify({ content: marked }),
             });
             log('ריצה-ראשונה: PUT עריכת פוסט ' + pid + ' -> ' + put.status);
             if (put.ok) GM_setValue(FIRSTRUN_KEY, true);
