@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeBB Unified – אוסף הכלים המאוחד
 // @namespace    https://mitmachim.top/nodebb-unified/
-// @version      2.1.2
+// @version      2.1.3
 // @description  מאחד את סקריפטי NodeBB המקוריים במודולים מבודדים עם פאנל ניהול מרכזי, גיבוי ואבחון
 // @author       מחברי הסקריפטים המקוריים
 // @updateURL    https://raw.githubusercontent.com/moishyf/NodeBB-Unified/main/NodeBB-Unified.user.js
@@ -33241,14 +33241,33 @@
     }
 
     /* ---------- סריקת פוסטים/צ'אט לזיהוי הסימן ---------- */
-    // טקסט לזיהוי הסימן, ללא תוכן ציטוטים (blockquote): סימן בתוך ציטוט שייך למצוטט,
-    // לא לכותב - אחרת מי-שמצטט פוסט מסומן ייחשב בטעות למשתמש-סקריפט.
-    function markerText(el) {
-        if (!el) return '';
-        if (!el.querySelector('blockquote')) return el.textContent; // מהיר: אין ציטוט
+    // מנתח תוכן מרונדר: האם יש סימן, והאם ההודעה היא "רק-קישור" (לא יכולה לשאת סימן).
+    // - מסיר ציטוטים (blockquote): סימן בתוך ציטוט שייך למצוטט, לא לכותב.
+    // - link-only: אחרי הסרת הקישורים לא נשאר טקסט => היעדר-סימן חסר-משמעות (לא רושמים שלילה).
+    function analyzeContent(el) {
+        if (!el) return { marked: false, linkOnly: false };
+        if (!el.querySelector('blockquote') && !el.querySelector('a')) {
+            return { marked: hasMarker(el.textContent), linkOnly: false };
+        }
         const clone = el.cloneNode(true);
         clone.querySelectorAll('blockquote').forEach(b => b.remove());
-        return clone.textContent;
+        const marked = hasMarker(clone.textContent);
+        let linkOnly = false;
+        const links = clone.querySelectorAll('a');
+        if (links.length) {
+            links.forEach(a => a.remove());
+            linkOnly = clone.textContent.trim() === '';
+        }
+        return { marked, linkOnly };
+    }
+
+    // רושם נוכחות רק כשיש מסקנה: סימן => משתמש; אין סימן אך היה יכול לשאת => לא-משתמש;
+    // רק-קישור (לא יכול לשאת סימן) => לא מכריעים, כדי שפוסט/הודעה אחרונים שהם קישור לא ישברו.
+    function recordFrom(uid, key, el) {
+        if (!uid || uid === '0') return;
+        const { marked, linkOnly } = analyzeContent(el);
+        if (marked) recordPresence(uid, key, true);
+        else if (!linkOnly) recordPresence(uid, key, false);
     }
 
     function scanContainer(root) {
@@ -33258,17 +33277,16 @@
         // פוסטים
         scope.querySelectorAll('[component="post"][data-pid]').forEach(post => {
             const uid = post.getAttribute('data-uid');
-            if (!uid || uid === '0') return;
             const body = post.querySelector('[component="post/content"]') || post;
-            recordPresence(uid, post.getAttribute('data-pid'), hasMarker(markerText(body)));
+            recordFrom(uid, post.getAttribute('data-pid'), body);
         });
 
         // הודעות צ'אט
         scope.querySelectorAll('[component="chat/message"][data-mid]').forEach(msg => {
             const host = msg.closest('[data-uid]') || msg.querySelector('[data-uid]');
             const uid = (host && host.getAttribute('data-uid')) || msg.getAttribute('data-uid');
-            if (!uid || uid === '0') return;
-            recordPresence(uid, msg.getAttribute('data-mid'), hasMarker(markerText(msg)));
+            const bodyEl = msg.querySelector('[component="chat/message/body"]') || msg;
+            recordFrom(uid, msg.getAttribute('data-mid'), bodyEl);
         });
     }
 
