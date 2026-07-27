@@ -4251,8 +4251,7 @@
         subtree: true
     });
 
-    // ליתר ביטחון
-    setInterval(fix, 500);
+    
 })();
 /* SOURCE_END: מראה שלוש נקודות.txt */
         }
@@ -6066,7 +6065,6 @@
         scanForTextareas();
     }
 
-    setInterval(scanForTextareas, 1000);
 
     const observer = new MutationObserver(scanForTextareas);
     observer.observe(document.body, { childList: true, subtree: true, attributes: false });
@@ -11968,7 +11966,7 @@
 
     const CONFIG = {
         refreshInterval: 60 * 1000,
-        scanInterval: 2000,
+        scanInterval: 5000,
         onlineColor: '#22bd59',
         borderColor: '#ffffff'
     };
@@ -22786,7 +22784,7 @@
 
         lastUrl = location.href;
         handleNavigation();
-    }, 250);
+    }, 1500);
 
     /* =========================================================
        הרצה ראשונית
