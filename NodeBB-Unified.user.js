@@ -22836,7 +22836,14 @@
     const CONFIG = {
         itemId: 'prozi-last-read-item',
         linkId: 'prozi-last-read-link',
-        url: '/me/read',
+        get url() {
+            // משתמש בנתיב המובנה של NodeBB (אם קיים), או בודק ידנית אם הכתובת מתחילה ב-/forum
+            const basePath = (typeof window.config !== 'undefined' && window.config.relative_path) 
+                ? window.config.relative_path 
+                : (window.location.pathname.startsWith('/forum') ? '/forum' : '');
+            
+            return basePath + '/me/read';
+        },
         text: 'הודעות אחרונות שנקראו',
         tooltip: 'הודעות אחרונות שנקראו'
     };
